@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Meshtastic Location Precision Grid Visualizer</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
+        #map { height: 100vh; width: 100%; }
+        .info-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: white;
+            padding: 15px;
+            border-radius: 5px;
+            box-shadow: 0 0 15px rgba(0,0,0,0.2);
+            z-index: 1000;
+            max-width: 300px;
+        }
+        .precision-controls {
+            margin-bottom: 10px;
+        }
+        label { font-weight: bold; margin-right: 10px; }
+        select, input { margin: 5px 0; }
+        .cell-info {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #ccc;
+            font-size: 12px;
+        }
+        button {
+            padding: 5px 10px;
+            margin: 5px 0;
+            cursor: pointer;
+        }
+        .location-display {
+            font-size: 11px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="info-panel">
+        <h3>Meshtastic Grid Visualizer</h3>
+        <div class="precision-controls">
+            <label for="precision">Precision (bits):</label><br>
+            <input type="range" id="precision" min="10" max="20" value="15" step="1">
+            <span id="precision-value">15</span> bits
+        </div>
+        <div class="precision-controls">
+            <label>
+                <input type="checkbox" id="auto-update" checked>
+                Auto-update on map move
+            </label><br>
+            <button id="refresh-btn">Refresh Grid</button>
+        </div>
+        <div class="cell-info">
+            <strong>Current View:</strong><br>
+            <div class="location-display">
+                Lat: <span id="current-lat">-</span>°<br>
+                Lon: <span id="current-lon">-</span>°
+            </div>
+        </div>
+        <div class="cell-info">
+            <strong>Cell Size:</strong><br>
+            <span id="cell-size-lat">-</span> m (N-S)<br>
+            <span id="cell-size-lon">-</span> m (E-W)<br>
+            <strong>Uncertainty Radius:</strong><br>
+            <span id="uncertainty">-</span> m
+        </div>
+        <div class="cell-info">
+            <strong>Legend:</strong><br>
+            <span style="color: #3388ff;">█ Blue rectangles</span> = Grid cells<br>
+            <span style="color: #ff9900;">○ Orange circles</span> = App uncertainty radius<br>
+            <span style="color: #ff0000;">● Red dots</span> = Reported position<br>
+        </div>
+        <div class="cell-info">
+            <strong>Instructions:</strong><br>
+            - Pan/zoom to any location<br>
+            - Grid updates automatically<br>
+            - Click cells or circles for info<br>
+            - Adjust precision slider
+        </div>
+    </div>
+    <div id="map"></div>
+
+    <script>
+        // Alphen aan den Rijn coordinates (initial view)
+        const initialLat = 52.1293;
+        const initialLon = 4.6567;
+
+        // Initialize the map
+        const map = L.map('map').setView([initialLat, initialLon], 13);
+
+        // Add OpenStreetMap tiles
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        let gridLayer = L.layerGroup().addTo(map);
+        let currentPrecision = 15;
+        let autoUpdate = true;
+
+        // Meshtastic position precision algorithm
+        function calculateGridCells(precision, centerLat, centerLon, gridSize = 5) {
+            const cells = [];
+
+            // Cell size in int32 units
+            const cellSizeInt32 = Math.pow(2, 32 - precision);
+
+            // Cell size in degrees
+            const cellSizeDeg = cellSizeInt32 / 10000000.0;
+
+            // Calculate cell size in meters
+            const latMeters = cellSizeDeg * 111320; // 1 degree lat ≈ 111.32 km
+            const lonMeters = cellSizeDeg * 111320 * Math.cos(centerLat * Math.PI / 180);
+            const uncertaintyRadius = Math.sqrt(latMeters * latMeters + lonMeters * lonMeters) / 2;
+
+            // Update info panel
+            document.getElementById('cell-size-lat').textContent = Math.round(latMeters);
+            document.getElementById('cell-size-lon').textContent = Math.round(lonMeters);
+            document.getElementById('uncertainty').textContent = Math.round(uncertaintyRadius);
+
+            // Convert center to int32
+            const centerLatInt = Math.round(centerLat * 10000000);
+            const centerLonInt = Math.round(centerLon * 10000000);
+
+            // Find the grid cell containing the center
+            const mask = ~((1 << (32 - precision)) - 1);
+            const baseCellLatInt = centerLatInt & mask;
+            const baseCellLonInt = centerLonInt & mask;
+
+            // Generate grid around center
+            const halfGrid = Math.floor(gridSize / 2);
+            for (let i = -halfGrid; i <= halfGrid; i++) {
+                for (let j = -halfGrid; j <= halfGrid; j++) {
+                    const cellLatInt = baseCellLatInt + (i * cellSizeInt32);
+                    const cellLonInt = baseCellLonInt + (j * cellSizeInt32);
+
+                    // Calculate cell boundaries
+                    const latMin = cellLatInt / 10000000.0;
+                    const latMax = (cellLatInt + cellSizeInt32) / 10000000.0;
+                    const lonMin = cellLonInt / 10000000.0;
+                    const lonMax = (cellLonInt + cellSizeInt32) / 10000000.0;
+
+                    // Calculate cell center (what Meshtastic reports)
+                    const centerOffset = 1 << (31 - precision);
+                    const reportedLatInt = cellLatInt + centerOffset;
+                    const reportedLonInt = cellLonInt + centerOffset;
+                    const reportedLat = reportedLatInt / 10000000.0;
+                    const reportedLon = reportedLonInt / 10000000.0;
+
+                    cells.push({
+                        bounds: [[latMin, lonMin], [latMax, lonMax]],
+                        center: [reportedLat, reportedLon],
+                        cellLatInt: cellLatInt,
+                        cellLonInt: cellLonInt
+                    });
+                }
+            }
+
+            return cells;
+        }
+
+        function drawGrid(precision) {
+            // Get current map center
+            const center = map.getCenter();
+            const centerLat = center.lat;
+            const centerLon = center.lng;
+
+            // Update location display
+            document.getElementById('current-lat').textContent = centerLat.toFixed(6);
+            document.getElementById('current-lon').textContent = centerLon.toFixed(6);
+
+            // Clear existing grid
+            gridLayer.clearLayers();
+
+            // Calculate and draw cells
+            const cells = calculateGridCells(precision, centerLat, centerLon, 9);
+
+            // Calculate uncertainty radius using Meshtastic formula (same for all cells)
+            const uncertaintyRadiusMeters = 23905787.925008 * Math.pow(0.5, precision);
+
+            cells.forEach(cell => {
+                // Draw cell boundary
+                const rectangle = L.rectangle(cell.bounds, {
+                    color: '#3388ff',
+                    weight: 2,
+                    fillColor: '#3388ff',
+                    fillOpacity: 0.1
+                });
+
+                // Add popup with cell info
+                rectangle.bindPopup(`
+                    <strong>Grid Cell</strong><br>
+                    <strong>Reported Position (Center):</strong><br>
+                    Lat: ${cell.center[0].toFixed(7)}°<br>
+                    Lon: ${cell.center[1].toFixed(7)}°<br>
+                    <br>
+                    <strong>Cell Bounds:</strong><br>
+                    Lat: ${cell.bounds[0][0].toFixed(7)}° to ${cell.bounds[1][0].toFixed(7)}°<br>
+                    Lon: ${cell.bounds[0][1].toFixed(7)}° to ${cell.bounds[1][1].toFixed(7)}°<br>
+                    <br>
+                    <strong>App Shows:</strong> ${Math.round(uncertaintyRadiusMeters)}m radius circle<br>
+                    <br>
+                    <em>Any real position within this cell reports the same center coordinates.</em>
+                `);
+
+                rectangle.addTo(gridLayer);
+
+                // Draw uncertainty circle (what the app shows)
+                L.circle(cell.center, {
+                    radius: uncertaintyRadiusMeters,
+                    color: '#ff9900',
+                    weight: 2,
+                    fillColor: '#ff9900',
+                    fillOpacity: 0.15,
+                    dashArray: '5, 5'
+                }).addTo(gridLayer).bindPopup(`
+                    <strong>Uncertainty Circle</strong><br>
+                    This is what the Meshtastic app displays.<br>
+                    Radius: ${Math.round(uncertaintyRadiusMeters)}m<br>
+                    <br>
+                    <em>The actual position could be anywhere within this circle.</em>
+                `);
+
+                // Draw center point
+                L.circleMarker(cell.center, {
+                    radius: 4,
+                    color: '#ff0000',
+                    fillColor: '#ff0000',
+                    fillOpacity: 0.8
+                }).addTo(gridLayer);
+            });
+        }
+
+        // Precision slider handler
+        document.getElementById('precision').addEventListener('input', function(e) {
+            currentPrecision = parseInt(e.target.value);
+            document.getElementById('precision-value').textContent = currentPrecision;
+            drawGrid(currentPrecision);
+        });
+
+        // Auto-update checkbox handler
+        document.getElementById('auto-update').addEventListener('change', function(e) {
+            autoUpdate = e.target.checked;
+        });
+
+        // Refresh button handler
+        document.getElementById('refresh-btn').addEventListener('click', function() {
+            drawGrid(currentPrecision);
+        });
+
+        // Map move handler - redraw grid when map is moved
+        map.on('moveend', function() {
+            if (autoUpdate) {
+                drawGrid(currentPrecision);
+            }
+        });
+
+        // Initial grid draw
+        drawGrid(currentPrecision);
+    </script>
+</body>
+</html>
