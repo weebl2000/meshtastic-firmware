@@ -158,23 +158,13 @@ static const uint8_t SCK = PIN_SPI_SCK;
 #define SX126X_BUSY (9)
 #define SX126X_RESET (4)
 
-/*
- * SKY66122-11 Front-End Module control (RAK13302 1W module)
- *
- * CSD (P0.24) — Chip enable: HIGH to power up the FEM, LOW for shutdown (<1 μA)
- * CPS (P0.21) — Path select: HIGH = active (required for TX and RX), LOW = shutdown
- * CTX (P0.31) — TX/RX select + 5 V boost enable:
- *                HIGH = TX mode (boost on, PA energized at 5 V)
- *                LOW  = RX mode (boost off, LNA on 3.3 V)
- *
- * R25 (DIO2→CTX) is NC by default on the RAK13302, so the MCU must drive CTX directly.
- */
-#define USE_LORA_FEM
-#define LORA_FEM_CSD (24) // Chip enable
-#define LORA_FEM_CPS (21) // Path select (HIGH for both TX and RX)
-#define LORA_FEM_CTX (31) // TX/RX select + 5V boost (MCU-driven, R25 NC)
-
-// Configure SX1262 DIO2 as RF-switch control output (not connected on this module, R25 NC)
+// SKY66122-11 FEM control on the RAK13302 module:
+//   CSD + CPS are tied together on the PCB, routed to WisBlock IO3 (P0.21).
+//   Setting IO3 HIGH enables the FEM (LNA for RX, PA path for TX).
+//   CTX is connected to SX1262 DIO2 — the radio handles TX/RX switching
+//   in hardware via SetDIO2AsRfSwitchCtrl (microsecond-accurate, no GPIO needed).
+//   The 5V boost for the PA is enabled by WB_IO2 (P0.34 = 3V3_S rail).
+#define SX126X_POWER_EN (21) // P0.21 = IO3 -> SKY66122 CSD+CPS (FEM enable)
 #define SX126X_DIO2_AS_RF_SWITCH
 #define SX126X_DIO3_TCXO_VOLTAGE 1.8
 

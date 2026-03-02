@@ -6,7 +6,7 @@
 #ifdef ARCH_PORTDUINO
 #include "PortduinoGlue.h"
 #endif
-#if defined(USE_LORA_FEM) && defined(ARCH_ESP32)
+#if defined(USE_GC1109_PA) && defined(ARCH_ESP32)
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
 #endif
@@ -56,53 +56,41 @@ template <typename T> bool SX126xInterface<T>::init()
     pinMode(SX126X_POWER_EN, OUTPUT);
 #endif
 
-#if defined(USE_LORA_FEM)
-    // FEM chip initialization (GC1109 / SKY66122-11)
+#if defined(USE_GC1109_PA)
+    // GC1109 FEM chip initialization
     // See variant.h for full pin mapping and control logic documentation
     //
-    // On deep sleep wake (ESP32 with LORA_FEM_POWER), power and CSD are held HIGH
-    // by RTC latch. We configure GPIO registers before releasing the hold so the
-    // pad transitions atomically from held-HIGH to register-HIGH with no glitch.
+    // On deep sleep wake, PA_POWER and PA_EN are held HIGH by RTC latch (set in
+    // enableLoraInterrupt). We configure GPIO registers before releasing the hold
+    // so the pad transitions atomically from held-HIGH to register-HIGH with no
+    // power glitch. On cold boot the hold_dis is a harmless no-op.
 
-#ifdef LORA_FEM_POWER
-    pinMode(LORA_FEM_POWER, OUTPUT);
-    digitalWrite(LORA_FEM_POWER, HIGH);
-#if SOC_RTCIO_HOLD_SUPPORTED
-    rtc_gpio_hold_dis((gpio_num_t)LORA_FEM_POWER);
-#endif
-    // LDO startup delay — on cold boot, wait for supply to stabilise before
-    // driving CSD/CPS/CTX. On deep sleep wake the LDO was held on via RTC latch.
+    // VFEM_Ctrl (LORA_PA_POWER): Power enable for GC1109 LDO (always on)
+    pinMode(LORA_PA_POWER, OUTPUT);
+    digitalWrite(LORA_PA_POWER, HIGH);
+    rtc_gpio_hold_dis((gpio_num_t)LORA_PA_POWER);
+
+    // TLV75733P LDO has ~550us startup time (datasheet tSTR). On cold boot, wait
+    // for VBAT to stabilise before driving CSD/CPS, per GC1109 requirement:
+    // "VBAT must be prior to CSD/CPS/CTX for the power on sequence"
+    // On deep sleep wake the LDO was held on via RTC latch, so no delay needed.
 #if defined(ARCH_ESP32)
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED)
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED) {
         delayMicroseconds(1000);
+    }
 #else
     delayMicroseconds(1000);
 #endif
-#endif
 
-#ifdef LORA_FEM_CTX
-    // MCU-driven CTX: drive LOW first to prevent transient TX mode while
-    // CSD/CPS are being enabled (no pull-downs on RAK13302).
-    pinMode(LORA_FEM_CTX, OUTPUT);
-    digitalWrite(LORA_FEM_CTX, LOW);
-#endif
+    // CSD (LORA_PA_EN): Chip enable - must be HIGH to enable GC1109 for both RX and TX
+    pinMode(LORA_PA_EN, OUTPUT);
+    digitalWrite(LORA_PA_EN, HIGH);
+    rtc_gpio_hold_dis((gpio_num_t)LORA_PA_EN);
 
-    pinMode(LORA_FEM_CSD, OUTPUT);
-    digitalWrite(LORA_FEM_CSD, HIGH);
-#if SOC_RTCIO_HOLD_SUPPORTED
-    rtc_gpio_hold_dis((gpio_num_t)LORA_FEM_CSD);
-#endif
-
-    pinMode(LORA_FEM_CPS, OUTPUT);
-#ifdef LORA_FEM_CTX
-    // MCU-driven CTX: CPS stays HIGH for both TX and RX
-    digitalWrite(LORA_FEM_CPS, HIGH);
-#else
-    // DIO2-driven CTX: CPS selects PA mode, start in RX-ready
-    digitalWrite(LORA_FEM_CPS, LOW);
-#endif
-
-    delay(1); // FEM settling time
+    // CPS (LORA_PA_TX_EN): PA mode select - HIGH enables full PA during TX, LOW for RX (don't care)
+    // Note: TX/RX path switching (CTX) is handled by DIO2 via SX126X_DIO2_AS_RF_SWITCH
+    pinMode(LORA_PA_TX_EN, OUTPUT);
+    digitalWrite(LORA_PA_TX_EN, LOW); // Start in RX-ready state
 #endif
 
 #ifdef RF95_FAN_EN
@@ -209,9 +197,9 @@ template <typename T> bool SX126xInterface<T>::init()
     // Undocumented SX1262 register patch recommended by Heltec/Semtech for improved RX sensitivity.
     // Sets bit 0 of register 0x8B5.
     if (module.SPIsetRegValue(0x8B5, 0x01, 0, 0) == RADIOLIB_ERR_NONE) {
-        LOG_INFO("Applied SX1262 register 0x8B5 patch for FEM RX improvement");
+        LOG_INFO("Applied SX1262 register 0x8B5 patch for GC1109 RX improvement");
     } else {
-        LOG_WARN("Failed to apply SX1262 register 0x8B5 patch");
+        LOG_WARN("Failed to apply SX1262 register 0x8B5 patch for GC1109");
     }
 
 #if 0
@@ -431,14 +419,14 @@ template <typename T> bool SX126xInterface<T>::sleep()
     digitalWrite(SX126X_POWER_EN, LOW);
 #endif
 
-#if defined(USE_LORA_FEM)
-#ifdef LORA_FEM_CTX
-    digitalWrite(LORA_FEM_CTX, LOW);
-#endif
-    digitalWrite(LORA_FEM_CPS, LOW);
-    digitalWrite(LORA_FEM_CSD, LOW);
-    // LORA_FEM_POWER intentionally left on — avoids frequent power cycling
-    // and deep sleep code in sleep.cpp re-latches CSD if LNA wake is needed
+#if defined(USE_GC1109_PA)
+    /*
+     * Do not switch the power on and off frequently.
+     * After turning off LORA_PA_EN, the power consumption has dropped to the uA level.
+     *  // digitalWrite(LORA_PA_POWER, LOW);
+     */
+    digitalWrite(LORA_PA_EN, LOW);
+    digitalWrite(LORA_PA_TX_EN, LOW);
 #endif
     return true;
 }
@@ -498,25 +486,13 @@ template <typename T> void SX126xInterface<T>::resetAGC()
     startReceive();
 }
 
-/** Control FEM PA mode.
- *  - With MCU-driven CTX (LORA_FEM_CTX defined), txon=true selects the TX path and txon=false selects the RX path.
- *  - With DIO2-driven CTX (no LORA_FEM_CTX), this toggles CPS (bypass vs active path); TX/RX path is controlled by the radio.
- */
+/** Control PA mode for GC1109 FEM - CPS pin selects full PA (txon=true) or bypass mode (txon=false) */
 template <typename T> void SX126xInterface<T>::setTransmitEnable(bool txon)
 {
-#if defined(USE_LORA_FEM)
-#ifdef LORA_FEM_POWER
-    digitalWrite(LORA_FEM_POWER, HIGH);
-#endif
-    digitalWrite(LORA_FEM_CSD, HIGH);
-#ifdef LORA_FEM_CTX
-    // MCU-driven CTX: CPS always HIGH, toggle CTX for TX/RX
-    digitalWrite(LORA_FEM_CPS, HIGH);
-    digitalWrite(LORA_FEM_CTX, txon ? HIGH : LOW);
-#else
-    // DIO2-driven CTX: toggle CPS for PA mode
-    digitalWrite(LORA_FEM_CPS, txon ? HIGH : LOW);
-#endif
+#if defined(USE_GC1109_PA)
+    digitalWrite(LORA_PA_POWER, HIGH);         // Ensure LDO is on
+    digitalWrite(LORA_PA_EN, HIGH);            // CSD=1: Chip enabled
+    digitalWrite(LORA_PA_TX_EN, txon ? 1 : 0); // CPS: 1=full PA, 0=bypass (for RX, CPS is don't care)
 #endif
 }
 
