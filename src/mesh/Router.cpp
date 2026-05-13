@@ -577,13 +577,35 @@ meshtastic_Routing_Error perhapsEncode(meshtastic_MeshPacket *p)
             p->decoded.bitfield |= (p->decoded.want_response << BITFIELD_WANT_RESPONSE_SHIFT);
             // Sign broadcast packets if payload + signature fits within the max Data payload.
             // The actual encoded size is checked after pb_encode (TOO_LARGE).
-            if (!p->pki_encrypted && isBroadcast(p->to) &&
-                p->decoded.payload.size + XEDDSA_SIGNATURE_SIZE < meshtastic_Constants_DATA_PAYLOAD_LEN) {
-                if (crypto->xeddsa_sign(p->from, p->id, p->decoded.portnum, p->decoded.payload.bytes, p->decoded.payload.size,
-                                        p->decoded.xeddsa_signature.bytes)) {
-                    p->decoded.xeddsa_signature.size = XEDDSA_SIGNATURE_SIZE;
-                    p->decoded.has_xeddsa_signature = true;
-                    LOG_DEBUG("XEdDSA signed packet 0x%08x", p->id);
+            if (!p->pki_encrypted && isBroadcast(p->to)) {
+                if (p->decoded.payload.size + XEDDSA_SIGNATURE_SIZE < meshtastic_Constants_DATA_PAYLOAD_LEN) {
+                    if (crypto->xeddsa_sign(p->from, p->id, p->decoded.portnum, p->decoded.payload.bytes,
+                                            p->decoded.payload.size, p->decoded.xeddsa_signature.bytes)) {
+                        p->decoded.xeddsa_signature.size = XEDDSA_SIGNATURE_SIZE;
+                        p->decoded.has_xeddsa_signature = true;
+                        LOG_DEBUG("XEdDSA signed packet 0x%08x", p->id);
+                    }
+                } else {
+                    // Payload + signature would exceed MAX Data payload. Send the packet
+                    // unsigned, but notify the API/phone so the user is aware the
+                    // message went out without its XEdDSA signature (silently sending
+                    // unsigned is dangerous because signature-aware peers may reject
+                    // the message outright per HAS_XEDDSA_SIGNED, and the sender has
+                    // no indication why delivery failed). Pairs with caveman99 review
+                    // of meshtastic/firmware#9610.
+                    LOG_WARN("XEdDSA: packet 0x%08x too large to sign (payload=%u + sig=%u >= max=%u), sending unsigned",
+                             p->id, (unsigned)p->decoded.payload.size, (unsigned)XEDDSA_SIGNATURE_SIZE,
+                             (unsigned)meshtastic_Constants_DATA_PAYLOAD_LEN);
+                    meshtastic_ClientNotification *cn = clientNotificationPool.allocZeroed();
+                    if (cn) {
+                        cn->has_reply_id = true;
+                        cn->reply_id = p->id;
+                        cn->level = meshtastic_LogRecord_Level_WARNING;
+                        cn->time = getValidTime(RTCQualityFromNet);
+                        snprintf(cn->message, sizeof(cn->message),
+                                 "Message too long to sign — sent unsigned. Shorten to enable XEdDSA signature.");
+                        service->sendClientNotification(cn);
+                    }
                 }
             }
         }
